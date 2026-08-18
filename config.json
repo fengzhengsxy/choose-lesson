@@ -1,0 +1,17 @@
+{
+  "student_id": "",
+  "turn_id": "",
+  "target_lesson_id": "181198",
+  "target_course_name": "人工智能与机器学习基础",
+  "limit_count": 117,
+  "interval_seconds": 60,
+  "jitter_seconds": 15,
+  "heart_beat": 300,
+  "active_hours": "",
+  "max_errors": 20,
+  "max_grab_failures": 3,
+  "mode": "spam",
+  "notify_webhook_url": "",
+  "headless": true,
+  "disable_browser_sandbox": false
+}

@@ -1,0 +1,16 @@
+{
+  "student_id": "",
+  "turn_id": "",
+  "target_lesson_id": "",
+  "target_course_name": "",
+  "limit_count": 0,
+  "interval_seconds": 60,
+  "jitter_seconds": 15,
+  "heart_beat": 300,
+  "active_hours": "6:30-1:00",
+  "max_errors": 20,
+  "max_grab_failures": 3,
+  "mode": "spam",
+  "notify_webhook_url": "",
+  "disable_browser_sandbox": false
+}
