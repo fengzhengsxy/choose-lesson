@@ -485,6 +485,7 @@ def main():
     ap = argparse.ArgumentParser(description="USTC 教务系统 监控式抢课（Windows / Linux 通用）")
     ap.add_argument("--lesson", help="目标课 lessonId，优先于配置文件")
     ap.add_argument("--name", help="目标课课程名（模糊匹配）")
+    ap.add_argument("--limit", type=int, help="目标课容量，优先于配置文件")
     ap.add_argument("-m", "--mode", choices=["spam", "monitor", "grab"],
                     help="spam 监控到空位就抢(推荐) | monitor 仅提醒 | grab 同 spam")
     ap.add_argument("-t", "--interval", type=int, help="查询基准间隔（秒）")
@@ -505,6 +506,7 @@ def main():
     cfg = load_config()
     if args.lesson: cfg["target_lesson_id"] = args.lesson
     if args.name: cfg["target_course_name"] = args.name
+    if args.limit is not None: cfg["limit_count"] = args.limit
     if args.mode: cfg["mode"] = args.mode
     if args.interval: cfg["interval_seconds"] = args.interval
 

@@ -12,5 +12,7 @@
   "max_grab_failures": 3,
   "mode": "spam",
   "notify_webhook_url": "",
-  "disable_browser_sandbox": false
+  "disable_browser_sandbox": false,
+  "targets": [],
+  "completion_policy": "all"
 }

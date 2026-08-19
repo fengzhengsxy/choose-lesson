@@ -11,13 +11,20 @@ import sys
 import tempfile
 import threading
 import tkinter as tk
-from tkinter import messagebox, scrolledtext, ttk
+from tkinter import messagebox, scrolledtext, simpledialog, ttk
 
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 CONFIG_PATH = os.path.join(HERE, "config.json")
 SCRIPT_PATH = os.path.join(HERE, "grabbing.py")
+MULTI_SCRIPT_PATH = os.path.join(HERE, "multi_grabbing.py")
 AUTH_PATH = os.path.join(HERE, "auth.json")
+EVENT_PREFIX = "__COURSE_EVENT__"
+STATUS_LABELS = {"pending": "等待启动", "running": "监控中", "full": "已满",
+                 "available": "发现空位", "submit_failed": "提交失败",
+                 "error": "查询异常", "fused": "已熔断",
+                 "login_expired": "登录过期", "completed": "已完成",
+                 "stopped": "已停止"}
 
 DEFAULT_CONFIG = {
     "student_id": "",
@@ -35,6 +42,8 @@ DEFAULT_CONFIG = {
     "notify_webhook_url": "",
     "headless": False,
     "disable_browser_sandbox": False,
+    "targets": [],
+    "completion_policy": "all",
 }
 
 INTEGER_RULES = {
@@ -112,11 +121,28 @@ def validate_config(cfg, for_run=False):
         errors.append("通知地址必须以 http:// 或 https:// 开头")
 
     if for_run:
-        if not (str(cfg.get("target_lesson_id", "")).strip()
-                or str(cfg.get("target_course_name", "")).strip()):
-            errors.append("请填写课程 lessonId 或课程名称")
-        if normalized.get("limit_count", 0) <= 0:
-            errors.append("开始监控前必须填写大于 0 的课程容量")
+        enabled_targets = [item for item in (cfg.get("targets") or [])
+                           if isinstance(item, dict) and item.get("enabled", True)]
+        pending_targets = [item for item in enabled_targets
+                           if item.get("status") != "completed"]
+        if enabled_targets:
+            if not pending_targets:
+                errors.append("并行课程均已完成；请重新设为待监控或添加新课程")
+            for index, target in enumerate(pending_targets, 1):
+                if not str(target.get("lesson_id", "")).strip():
+                    errors.append(f"并行课程 {index} 缺少 lessonId")
+                try:
+                    target_limit = int(target.get("limit_count") or 0)
+                except (TypeError, ValueError):
+                    target_limit = 0
+                if target_limit <= 0:
+                    errors.append(f"并行课程 {index} 的容量必须大于 0")
+        else:
+            if not (str(cfg.get("target_lesson_id", "")).strip()
+                    or str(cfg.get("target_course_name", "")).strip()):
+                errors.append("请填写单门课程 lessonId/名称，或先把课程加入并行监控列表")
+            if normalized.get("limit_count", 0) <= 0:
+                errors.append("开始监控前必须填写大于 0 的课程容量")
 
     return normalized, errors
 
@@ -228,6 +254,41 @@ def flatten_course_fields(value, prefix=""):
     return rows
 
 
+def normalize_gui_targets(cfg):
+    """返回界面可管理的有效目标，按 lessonId 去重。"""
+    result, seen = [], set()
+    for raw in cfg.get("targets") or []:
+        if not isinstance(raw, dict):
+            continue
+        lesson_id = str(raw.get("lesson_id") or "").strip()
+        name = str(raw.get("course_name") or "").strip()
+        try:
+            limit = int(raw.get("limit_count") or 0)
+        except (TypeError, ValueError):
+            limit = 0
+        if not lesson_id or lesson_id in seen:
+            continue
+        seen.add(lesson_id)
+        result.append({"lesson_id": lesson_id, "course_name": name,
+                       "limit_count": limit,
+                       "enabled": bool(raw.get("enabled", True)),
+                       "status": raw.get("status") or "pending",
+                       "completed_at": str(raw.get("completed_at") or "")})
+    return result
+
+
+def upsert_target(targets, target):
+    """按 lessonId 添加或更新目标，不产生重复课程。"""
+    normalized = [dict(item) for item in targets]
+    lesson_id = str(target["lesson_id"])
+    for index, item in enumerate(normalized):
+        if str(item.get("lesson_id")) == lesson_id:
+            normalized[index] = dict(target)
+            return normalized
+    normalized.append(dict(target))
+    return normalized
+
+
 class CourseBotGUI:
     FIELD_SPECS = (
         ("student_id", "学生关联 ID", "可留空自动识别"),
@@ -247,12 +308,13 @@ class CourseBotGUI:
     def __init__(self, root):
         self.root = root
         self.root.title("中科大选课监控助手")
-        self.root.geometry("980x780")
+        self.root.geometry("1040x820")
         self.root.minsize(860, 680)
         self.process = None
         self.pending_result_path = None
         self.pending_result_query = ""
         self.events = queue.Queue()
+        self.live_course_status = {}
         self.vars = {}
         self.python = resolve_python()
         self._build_ui()
@@ -323,6 +385,42 @@ class CourseBotGUI:
         ttk.Label(filter_row, text="支持名称片段、简称和少量错字；结果显示全部课程字段",
                   foreground="#666666").pack(side="left", padx=(10, 0))
 
+        target_row = ttk.Frame(outer)
+        target_row.pack(fill="x", pady=(0, 10))
+        self.target_count_var = tk.StringVar(value="并行课程：0 门")
+        ttk.Label(target_row, textvariable=self.target_count_var,
+                  font=("Microsoft YaHei UI", 10, "bold")).pack(side="left")
+        ttk.Button(target_row, text="将当前课程加入列表",
+                   command=self._add_current_target).pack(side="left", padx=(12, 6))
+        ttk.Button(target_row, text="管理并行课程",
+                   command=self._show_target_manager).pack(side="left", padx=6)
+        ttk.Label(target_row, text="完成策略").pack(side="left", padx=(22, 6))
+        self.completion_policy_var = tk.StringVar(value="所有课程分别抢到")
+        ttk.Combobox(target_row, textvariable=self.completion_policy_var, state="readonly",
+                     width=24, values=("所有课程分别抢到", "任意一门成功就停止全部")).pack(side="left")
+
+        dashboard = ttk.LabelFrame(outer, text="课程实时状态", padding=6)
+        dashboard.pack(fill="x", pady=(0, 10))
+        dashboard_columns = ("name", "lesson_id", "status", "seats", "updated", "message")
+        self.dashboard_tree = ttk.Treeview(dashboard, columns=dashboard_columns,
+                                           show="headings", height=6)
+        dashboard_headings = {"name": "课程", "lesson_id": "lessonId", "status": "状态",
+                              "seats": "人数", "updated": "更新时间", "message": "最新消息"}
+        dashboard_widths = {"name": 190, "lesson_id": 85, "status": 75,
+                            "seats": 65, "updated": 75, "message": 430}
+        for column in dashboard_columns:
+            self.dashboard_tree.heading(column, text=dashboard_headings[column])
+            self.dashboard_tree.column(column, width=dashboard_widths[column], anchor="w")
+        dashboard_y = ttk.Scrollbar(dashboard, orient="vertical",
+                                    command=self.dashboard_tree.yview)
+        self.dashboard_tree.configure(yscrollcommand=dashboard_y.set)
+        self.dashboard_tree.pack(side="left", fill="x", expand=True)
+        dashboard_y.pack(side="right", fill="y")
+        self.dashboard_tree.tag_configure("completed", foreground="#16833b")
+        self.dashboard_tree.tag_configure("available", foreground="#b35a00")
+        self.dashboard_tree.tag_configure("error", foreground="#b00020")
+        self.dashboard_tree.tag_configure("fused", foreground="#b00020")
+
         log_frame = ttk.LabelFrame(outer, text="运行日志", padding=8)
         log_frame.pack(fill="both", expand=True)
         self.log = scrolledtext.ScrolledText(
@@ -339,6 +437,10 @@ class CourseBotGUI:
         for key, var in self.vars.items():
             value = cfg.get(key, DEFAULT_CONFIG.get(key, ""))
             var.set(value)
+        self.completion_policy_var.set(
+            "任意一门成功就停止全部" if cfg.get("completion_policy") == "any"
+            else "所有课程分别抢到")
+        self._refresh_target_count()
 
     def _collect_form(self):
         try:
@@ -350,6 +452,8 @@ class CourseBotGUI:
         for key in ("student_id", "turn_id", "target_lesson_id",
                     "target_course_name", "notify_webhook_url"):
             existing[key] = str(existing.get(key, "")).strip()
+        existing["completion_policy"] = (
+            "any" if self.completion_policy_var.get().startswith("任意") else "all")
         return existing
 
     def save_form(self, for_run=False, quiet=False):
@@ -365,6 +469,164 @@ class CourseBotGUI:
         if not quiet:
             self._append_log("配置已保存。\n")
         return True
+
+    def _target_list(self):
+        try:
+            return normalize_gui_targets(load_config_file())
+        except Exception:
+            return []
+
+    def _refresh_target_count(self):
+        self._refresh_dashboard_from_config()
+        self._update_target_count_label()
+
+    def _update_target_count_label(self):
+        targets = [item for item in self._target_list() if item.get("enabled", True)]
+        completed = sum(1 for item in targets
+                        if self.live_course_status.get(item["lesson_id"], item.get("status"))
+                        == "completed")
+        self.target_count_var.set(
+            f"并行课程：待抢 {len(targets) - completed} 门 · 已完成 {completed} 门")
+
+    def _refresh_dashboard_from_config(self):
+        if not hasattr(self, "dashboard_tree"):
+            return
+        self.dashboard_tree.delete(*self.dashboard_tree.get_children())
+        self.live_course_status = {}
+        for target in self._target_list():
+            status = target.get("status") or "pending"
+            self.live_course_status[target["lesson_id"]] = status
+            message = (f"完成于 {target['completed_at']}" if target.get("completed_at") else "")
+            self.dashboard_tree.insert("", "end", iid=target["lesson_id"],
+                                       values=(target["course_name"], target["lesson_id"],
+                                               STATUS_LABELS.get(status, status), "", "", message),
+                                       tags=(status,))
+
+    def _apply_course_event(self, event):
+        lesson_id = str(event.get("lesson_id") or "")
+        if not lesson_id:
+            return
+        status = event.get("status") or "running"
+        self.live_course_status[lesson_id] = status
+        count, limit = event.get("count"), event.get("limit")
+        seats = f"{count}/{limit}" if count is not None and limit is not None else ""
+        values = (event.get("course_name") or lesson_id, lesson_id,
+                  STATUS_LABELS.get(status, status), seats,
+                  event.get("updated_at") or "", event.get("message") or "")
+        if self.dashboard_tree.exists(lesson_id):
+            self.dashboard_tree.item(lesson_id, values=values, tags=(status,))
+        else:
+            self.dashboard_tree.insert("", "end", iid=lesson_id, values=values, tags=(status,))
+        self._update_target_count_label()
+
+    def _handle_process_output(self, line):
+        if line.startswith(EVENT_PREFIX):
+            try:
+                self._apply_course_event(json.loads(line[len(EVENT_PREFIX):]))
+            except Exception as exc:
+                self._append_log(f"状态事件解析失败：{exc}\n")
+            return
+        self._append_log(line)
+
+    def _save_target_list(self, targets):
+        cfg = self._collect_form()
+        cfg["targets"] = targets
+        normalized, errors = validate_config(cfg, for_run=False)
+        if errors:
+            messagebox.showerror("配置需要修改", "\n".join(f"• {item}" for item in errors))
+            return False
+        save_config_file(normalized)
+        self._refresh_target_count()
+        return True
+
+    def _add_target(self, lesson_id, name, capacity, parent=None):
+        lesson_id = str(lesson_id or "").strip()
+        name = str(name or "").strip()
+        try:
+            capacity = int(str(capacity or "0").strip())
+        except ValueError:
+            capacity = 0
+        if not lesson_id:
+            messagebox.showerror("无法添加", "课程缺少 lessonId。", parent=parent)
+            return False
+        if capacity <= 0:
+            capacity = simpledialog.askinteger(
+                "填写课程容量", f"请输入 {name or lesson_id} 的准确容量：",
+                minvalue=1, parent=parent or self.root)
+            if not capacity:
+                return False
+        target = {"lesson_id": lesson_id, "course_name": name or f"lessonId={lesson_id}",
+                  "limit_count": capacity, "enabled": True,
+                  "status": "pending", "completed_at": ""}
+        targets = upsert_target(self._target_list(), target)
+        if not self._save_target_list(targets):
+            return False
+        self._append_log(f"已加入并行监控：{target['course_name']} "
+                         f"(lessonId={lesson_id}, 容量={capacity})\n")
+        return True
+
+    def _add_current_target(self):
+        self._add_target(self.vars["target_lesson_id"].get(),
+                         self.vars["target_course_name"].get(),
+                         self.vars["limit_count"].get())
+
+    def _show_target_manager(self):
+        window = tk.Toplevel(self.root)
+        window.title("并行监控课程")
+        window.geometry("760x430")
+        window.transient(self.root)
+        outer = ttk.Frame(window, padding=10)
+        outer.pack(fill="both", expand=True)
+        ttk.Label(outer, text="所有课程会在开始监控时同时启动独立任务。",
+                  foreground="#555555").pack(anchor="w", pady=(0, 8))
+        tree = ttk.Treeview(outer, columns=("id", "name", "capacity", "status", "completed"),
+                            show="headings", selectmode="extended")
+        tree.heading("id", text="lessonId")
+        tree.heading("name", text="课程名称")
+        tree.heading("capacity", text="容量")
+        tree.heading("status", text="状态")
+        tree.heading("completed", text="完成时间")
+        tree.column("id", width=95)
+        tree.column("name", width=300)
+        tree.column("capacity", width=60)
+        tree.column("status", width=75)
+        tree.column("completed", width=145)
+        tree.pack(fill="both", expand=True)
+
+        def reload_tree():
+            tree.delete(*tree.get_children())
+            for index, target in enumerate(self._target_list()):
+                status = target.get("status") or "pending"
+                tree.insert("", "end", iid=str(index), values=(
+                    target["lesson_id"], target["course_name"], target["limit_count"],
+                    STATUS_LABELS.get(status, status), target.get("completed_at", "")))
+
+        def remove_selected():
+            selected = {int(iid) for iid in tree.selection()}
+            if not selected:
+                return
+            targets = [item for index, item in enumerate(self._target_list())
+                       if index not in selected]
+            self._save_target_list(targets)
+            reload_tree()
+
+        def reset_selected():
+            selected = {int(iid) for iid in tree.selection()}
+            if not selected:
+                return
+            targets = self._target_list()
+            for index in selected:
+                targets[index]["status"] = "pending"
+                targets[index]["completed_at"] = ""
+            self._save_target_list(targets)
+            reload_tree()
+
+        reload_tree()
+        buttons = ttk.Frame(outer)
+        buttons.pack(fill="x", pady=(8, 0))
+        ttk.Button(buttons, text="删除选中课程", command=remove_selected).pack(side="left")
+        ttk.Button(buttons, text="重新设为待监控", command=reset_selected).pack(side="left", padx=8)
+        ttk.Button(buttons, text="关闭", command=window.destroy).pack(side="right")
 
     def _runtime_ready(self):
         check = subprocess.run(
@@ -396,7 +658,10 @@ class CourseBotGUI:
                 messagebox.showinfo("请输入筛选条件", "请输入课程名称、名称片段、简称或 lessonId。")
                 return
 
-        command = [self.python, SCRIPT_PATH]
+        enabled_targets = [item for item in self._target_list()
+                           if item.get("enabled", True) and item.get("status") != "completed"]
+        command = ([self.python, MULTI_SCRIPT_PATH] if action == "run" and enabled_targets
+                   else [self.python, SCRIPT_PATH])
         labels = {"login": "登录", "list": "课程列表", "filter": "课程筛选", "run": "监控"}
         if action == "login":
             command.append("--login")
@@ -416,6 +681,7 @@ class CourseBotGUI:
         env = os.environ.copy()
         env["PYTHONUTF8"] = "1"
         env["PYTHONUNBUFFERED"] = "1"
+        env["USTC_GUI_EVENTS"] = "1"
         try:
             self.process = subprocess.Popen(
                 command, cwd=HERE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
@@ -448,7 +714,7 @@ class CourseBotGUI:
             while True:
                 kind, value = self.events.get_nowait()
                 if kind == "log":
-                    self._append_log(value)
+                    self._handle_process_output(value)
                 elif kind == "finished":
                     self._process_finished(value)
         except queue.Empty:
@@ -466,6 +732,7 @@ class CourseBotGUI:
         self.start_button.configure(state="normal")
         self.stop_button.configure(state="disabled")
         self._refresh_status()
+        self._refresh_target_count()
 
     def _open_pending_results(self):
         path = self.pending_result_path
@@ -591,10 +858,22 @@ class CourseBotGUI:
                              f"(lessonId={summary['lesson_id']})\n")
             messagebox.showinfo("已填入", "课程信息已填入主界面并保存。", parent=window)
 
+        def add_selected_to_parallel():
+            index = selected_index()
+            if index is None:
+                messagebox.showinfo("请选择课程", "请先在左侧选择一门课程。", parent=window)
+                return
+            summary = summaries[index]
+            if self._add_target(summary["lesson_id"],
+                                summary["name_zh"] or summary["name_en"],
+                                summary["capacity"], parent=window):
+                messagebox.showinfo("已加入", "课程已加入并行监控列表。", parent=window)
+
         course_tree.bind("<<TreeviewSelect>>", show_details)
         buttons = ttk.Frame(outer)
         buttons.pack(fill="x", pady=(8, 0))
         ttk.Button(buttons, text="填入主界面", command=use_selected).pack(side="left")
+        ttk.Button(buttons, text="加入并行监控", command=add_selected_to_parallel).pack(side="left", padx=8)
         ttk.Button(buttons, text="复制 lessonId", command=copy_lesson_id).pack(side="left", padx=8)
         ttk.Button(buttons, text="关闭", command=window.destroy).pack(side="right")
 

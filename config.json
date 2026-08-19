@@ -1,9 +1,9 @@
 {
   "student_id": "",
   "turn_id": "",
-  "target_lesson_id": "181198",
-  "target_course_name": "人工智能与机器学习基础",
-  "limit_count": 117,
+  "target_lesson_id": "179778",
+  "target_course_name": "数学分析(B1)",
+  "limit_count": 120,
   "interval_seconds": 60,
   "jitter_seconds": 15,
   "heart_beat": 300,
@@ -13,5 +13,16 @@
   "mode": "spam",
   "notify_webhook_url": "",
   "headless": true,
-  "disable_browser_sandbox": false
+  "disable_browser_sandbox": false,
+  "targets": [
+    {
+      "lesson_id": "177919",
+      "course_name": "Web信息处理与应用",
+      "limit_count": 178,
+      "enabled": true,
+      "status": "pending",
+      "completed_at": ""
+    }
+  ],
+  "completion_policy": "all"
 }
